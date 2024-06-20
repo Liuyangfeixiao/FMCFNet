@@ -7,7 +7,196 @@ from torch import Tensor, einsum
 from einops import rearrange
 import einops
 from .ts_resnet import TwoStreamResNet
+
+from mmcv.cnn import ConvModule
+from mmdet.models.utils import make_divisible
 from mmrotate.registry import MODELS
+
+class Involution(nn.Module):
+    """ Involution 对每一个空间位置都是不同的kernel, 无法改变通道维度
+        Convolution 对每一个通道位置都是不同的kernel
+    """
+    def __init__(self, channels, kernel_size=7, dilation=1, stride=1, 
+                 group_channels=16, reduce_ratio=4) -> None:
+        super().__init__()
+        assert not (channels % group_channels or channels % reduce_ratio)
+
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+
+        # 每组多少个通道
+        self.group_channels = group_channels
+        self.groups = channels // group_channels
+        # reduce channels
+        self.reduce = nn.Sequential(
+            nn.Conv2d(channels, channels // reduce_ratio, 1),
+            nn.BatchNorm2d(channels // reduce_ratio),
+            nn.ReLU()
+        )
+        # span channels
+        self.span = nn.Conv2d(
+            channels // reduce_ratio,
+            self.groups * kernel_size ** 2, 1)
+        self.down_sample = nn.AvgPool2d(stride) if stride != 1 else nn.Identity()
+        self.unfold = nn.Unfold(kernel_size, dilation=dilation, padding=dilation*(kernel_size-1) // 2, stride=stride)
+    
+    def forward(self, x):
+        # generate involution kernel: (B, G*K*K, H, W)
+        weight_matrix = self.span(self.reduce(self.down_sample(x)))
+        b, _, h, w = weight_matrix.shape
+
+        # unfold input (b, C*K*K, h, w)
+        x_unfolded = self.unfold(x)
+        # (b, G, C//G, K*K, h, w)
+        x_unfolded = x_unfolded.reshape(b, self.groups, self.group_channels, self.kernel_size**2, h, w)
+        #  (b,G*K*K,h,w) -> (b,G,1,K*K,h,w)
+        weight_matrix = weight_matrix.reshape(b, self.groups, 1, self.kernel_size**2, h, w)
+        # (b, G, C//G, h, w)
+        mul_add = (weight_matrix * x_unfolded).sum(dim=3)
+        # (b, C, H, W)
+        out = mul_add.reshape(b, self.channels, h, w)
+        return out 
+
+class Attention(nn.Module):
+    def __init__(self, d_model, d_k, d_v, heads, sr_ratio,
+                 attn_drop=.1, resid_drop=.1) -> None:
+        super().__init__()
+        assert d_model % heads == 0
+        self.d_model = d_model
+        self.d_k = d_model // heads
+        self.d_v = d_model // heads
+        self.heads = heads
+
+        self.scale = self.d_v ** -0.5
+
+        self.q = nn.Linear(d_model, d_model)
+        self.kv = nn.Linear(d_model, d_model*2)
+        self.attn_drop = nn.Dropout(attn_drop)
+
+        self.proj = nn.Linear(d_model, d_model)
+        self.proj_drop = nn.Dropout(resid_drop)
+
+        self.out = nn.Conv2d(d_model, d_model, kernel_size=1)
+        self.sr_ratio = sr_ratio
+
+        # Spatial Reduction 实现等同于一个卷积层
+        if sr_ratio > 1:
+            self.spatial_reduce = nn.Conv2d(d_model, d_model, kernel_size=sr_ratio, stride=sr_ratio)
+            self.norm = nn.LayerNorm(d_model)
+
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = x.reshape(B, C, -1).permute(0, 2, 1)  # (B, H*W, C)
+        # (B, heads, H*W, C//heads)
+        q = self.q(x).reshape(B, -1, self.heads, C // self.heads).permute(0, 2, 1, 3)
+
+        if self.sr_ratio > 1:
+            x_ = x.permute(0, 2, 1).reshape(B, C, H, W)
+            x_ = self.spatial_reduce(x_).reshape(B, C, -1).permute(0, 2, 1)  # (B, h*w, C)
+            kv = self.kv(x_).reshape(B, -1, 2, self.heads, C // self.heads).permute(2, 0, 3, 1, 4)
+        else:
+            kv = self.kv(x).reshape(B, -1, 2, self.heads, C // self.heads).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, heads, H*W, h*w)
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = (attn @ v).transpose(1, 2).reshape(B, H*W, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        out = out.permute(0, 2, 1).reshape(B, C, H, W)
+        out = self.out(out)
+
+        return out
+    
+class InceptionBottleneck(nn.Module):
+    def __init__(self, in_channels,
+                 out_channels = None, 
+                 kernel_sizes = [3, 3, 5, 5],
+                 dilations = [1, 8, 2, 3],
+                 expansion = 1.0,
+                 sr_ratio=1,
+                 ratio=16,
+                 add_identity = True) -> None:
+        super().__init__()
+        out_channels = out_channels or in_channels
+        hidden_channels = make_divisible(int(expansion * out_channels), 8)
+        assert len(kernel_sizes) == len(dilations)
+        self.num_branch = len(kernel_sizes) + 1
+        self.pre_conv = ConvModule(in_channels, hidden_channels, kernel_size=1, 
+                                   norm_cfg=dict(type='BN'), act_cfg=dict(type='SiLU'))
+
+        self.branches = nn.ModuleList()
+
+        for i in range(len(kernel_sizes)):
+            self.branches.append(
+                nn.Sequential(
+                    Involution(hidden_channels,
+                               kernel_size=kernel_sizes[i],
+                               dilation=dilations[i]),
+                    nn.BatchNorm2d(hidden_channels),
+                    nn.SiLU()
+                ))
+        
+        self.attn = Attention(hidden_channels, hidden_channels, hidden_channels, 
+                              heads=8, sr_ratio=sr_ratio)
+        self.add_identity = add_identity and in_channels == out_channels
+        self.post_conv = ConvModule(hidden_channels * self.num_branch, out_channels, kernel_size=1,
+                                    norm_cfg=dict(type='BN'), act_cfg=dict(type='SiLU'))
+        
+        # channel attention
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveAvgPool2d(1)
+        self.f1 = nn.Conv2d(self.num_branch * hidden_channels, 
+                            self.num_branch * hidden_channels // ratio,
+                            kernel_size=1, bias=False)
+        self.act = nn.SiLU()
+        self.f2 = nn.Conv2d(self.num_branch * hidden_channels // ratio,
+                            out_channels, kernel_size=1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+        self.final_conv = ConvModule(out_channels, out_channels, kernel_size=1,
+                                     norm_cfg=dict(type='BN'), act_cfg=dict(type='SiLU'))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        short_cut = x
+        x = self.pre_conv(x)
+        out = []
+        for i in range(self.num_branch-1):
+            out.append(self.branches[i](x))
+        out.append(self.attn(x))
+        out = torch.cat(out, dim=1)  # (B, K * hidden_channels, H, W)
+        tmp = self.post_conv(out)
+        if self.add_identity:
+            tmp = tmp + short_cut
+        # channel attention
+        avg_out = self.f2(self.act(self.f1(self.avg_pool(out))))
+        max_out = self.f2(self.act(self.f1(self.max_pool(out))))
+        out = self.sigmoid(avg_out+max_out)
+        out = out * tmp
+        out = self.final_conv(out)
+
+        return out
 
 class LowPassModule(nn.Module):
     def __init__(self, in_channels, sizes=(1, 2, 3, 6)) -> None:
