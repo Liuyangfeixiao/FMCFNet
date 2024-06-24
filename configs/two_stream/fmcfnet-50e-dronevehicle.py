@@ -1,7 +1,7 @@
 _base_ = ['../_base_/default_runtime.py', '../_base_/schedules/schedule_6x.py',
           './dronevehicle.py']
 max_epochs = 50
-base_lr = 0.004 / 16
+base_lr = 0.0004 / 16
 interval = 1
 
 angle_version = 'le90'

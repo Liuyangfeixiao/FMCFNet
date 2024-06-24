@@ -11,6 +11,15 @@
             "program": "${workspaceFolder}/tools/train.py",
             "args": ["configs/two_stream/two_stream-3x-dronevehicle.py"],
             "console": "integratedTerminal"
+        },
+        {
+            "name": "TwoStreamDetector",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tools/train.py",
+            "args": ["configs/two_stream/fmcfnet-50e-dronevehicle.py",
+                    "--resume"],
+            "console": "integratedTerminal"
         }
     ]
 }
